@@ -174,8 +174,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
-	VoteGranted bool
+	Term          int
+	VoteGranted   bool
+	ReplyReceived bool
 }
 
 //
@@ -185,8 +186,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// colorGreen := "\033[32m"
 	DPrintf("peerID: %v, voting for term: %v candidate: %v", rf.me, args.Term, args.CandidateId)
-	DPrintf("current term: %v, current index: %v", rf.currentTerm, rf.commitIndex)
-	DPrintf("last term: %v, last index: %v", args.LastLogTerm, args.LastLogIndex)
+	DPrintf("peerID: %v, current term: %v, current index: %v", rf.me, rf.currentTerm, rf.commitIndex)
+	DPrintf("peerID: %v, last term: %v, last index: %v", rf.me, args.LastLogTerm, args.LastLogIndex)
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
@@ -194,9 +195,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.mu.Lock()
-	DPrintf("votedFor: %v", rf.votedFor)
+	DPrintf("peerID: %v, votedFor: %v", rf.me, rf.votedFor)
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogIndex >= rf.commitIndex && args.LastLogTerm >= rf.currentTerm) {
-		rf.votedFor = args.CandidateId
 		reply.Term = args.Term
 		reply.VoteGranted = true
 	}
@@ -300,27 +300,20 @@ func (rf *Raft) ticker() {
 			DPrintf("Election timeout for %v\n", rf.me)
 			rf.votedFor = -1
 		}
+		noLeader := rf.votedFor == -1
 		rf.mu.Unlock()
 
-		if rf.votedFor == -1 {
-			var request = &RequestVoteArgs{
+		if noLeader {
+			request := &RequestVoteArgs{
 				Term:         rf.currentTerm + 1,
 				CandidateId:  rf.me,
 				LastLogIndex: rf.commitIndex,
 				LastLogTerm:  rf.currentTerm,
 			}
 
-			replies := rf.sendRequestVotesAllPeers(request)
+			electionWon := rf.sendRequestVotesAllPeers(request)
 
-			var receivedVoteCount int
-			for i := range replies {
-				reply := replies[i]
-				if reply.VoteGranted {
-					receivedVoteCount += 1
-				}
-			}
-
-			if receivedVoteCount > len(replies)/2 {
+			if electionWon {
 				rf.mu.Lock()
 				rf.votedFor = rf.me
 				rf.currentTerm = request.Term
@@ -375,27 +368,48 @@ func (rf *Raft) tickHeartbeats() {
 	}
 }
 
-func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) []*RequestVoteReply {
-	var replies = make([]*RequestVoteReply, len(rf.peers))
+func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
+	// replies := make([]*RequestVoteReply, len(rf.peers))
+	votesGranted, repliesReceived := 1, 1
 
-	// receivedVoteCount := 0
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
-			replies[i] = &RequestVoteReply{
-				VoteGranted: true,
-				Term:        request.Term,
-			}
 			continue
 		}
-		DPrintf("sending vote request for %v to peer %v for term %v...", request.CandidateId, i, request.Term)
-		var reply = &RequestVoteReply{}
-		rf.sendRequestVote(i, request, reply)
-		DPrintf(" received %v for candidate %v from peer %v for term %v\n", reply.VoteGranted, rf.me, i, request.Term)
-		replies[i] = reply
+		peerId := i
+		go func() {
+			DPrintf("sending vote request for %v to peer %v for term %v...", request.CandidateId, peerId, request.Term)
+			reply := &RequestVoteReply{}
+			rf.sendRequestVote(peerId, request, reply)
+			DPrintf(" received %v for candidate %v from peer %v for term %v\n", reply.VoteGranted, rf.me, peerId, request.Term)
+			rf.mu.Lock()
+			if reply.VoteGranted {
+				votesGranted += 1
+			}
+			repliesReceived += 1
+			rf.mu.Unlock()
+		}()
 	}
 
 	// runtime.Breakpoint()
-	return replies
+	majority := (len(rf.peers) + 1) / 2
+
+	for true {
+		rf.mu.Lock()
+		if votesGranted >= majority || repliesReceived >= len(rf.peers) {
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+	}
+
+	DPrintf("granted %v out of majority %v", votesGranted, majority)
+	electionWon := false
+	rf.mu.Lock()
+	electionWon = votesGranted >= majority
+	rf.mu.Unlock()
+
+	return electionWon
 }
 
 type AppendEntriesRequest struct {
@@ -452,14 +466,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.votedFor = -1
-	rf.electionTimeout = 1000
+	rf.electionTimeout = getRandomRange(150, 300)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	i := getRandomRange(150, 300)
-	time.Sleep(time.Duration(i) * time.Millisecond)
 	go rf.ticker()
 
 	return rf
