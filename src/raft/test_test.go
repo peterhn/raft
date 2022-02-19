@@ -115,6 +115,7 @@ func TestManyElections2A(t *testing.T) {
 	fmt.Printf("disconnecting random nodes...\n")
 	iters := 10
 	for ii := 1; ii < iters; ii++ {
+		fmt.Printf("RUNNING iteration: %v out of %v\n", ii, iters)
 		// disconnect three nodes
 		i1 := rand.Int() % servers
 		i2 := rand.Int() % servers

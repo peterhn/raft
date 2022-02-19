@@ -57,6 +57,14 @@ type LogEntry struct {
 	Term  int
 }
 
+type State int
+
+const (
+	Follower  State = 0
+	Candidate       = 1
+	Leader          = 2
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -81,6 +89,7 @@ type Raft struct {
 
 	leaderMessageTimestamp int64
 	electionTimeout        int64
+	state                  State
 }
 
 // return currentTerm and whether this server
@@ -92,7 +101,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	term = rf.currentTerm
-	isleader = rf.votedFor == rf.me
+	isleader = rf.state == Leader
 	rf.mu.Unlock()
 
 	return term, isleader
@@ -185,18 +194,29 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// colorGreen := "\033[32m"
-	DPrintf("peerID: %v, voting for term: %v candidate: %v", rf.me, args.Term, args.CandidateId)
-	DPrintf("peerID: %v, current term: %v, current index: %v", rf.me, rf.currentTerm, rf.commitIndex)
-	DPrintf("peerID: %v, last term: %v, last index: %v", rf.me, args.LastLogTerm, args.LastLogIndex)
 
+	rf.mu.Lock()
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
 		return
 	}
 
-	rf.mu.Lock()
+	DPrintf("peerID: %v, voting for term: %v candidate: %v", rf.me, args.Term, args.CandidateId)
+	DPrintf("peerID: %v, current term: %v, current index: %v", rf.me, rf.currentTerm, rf.commitIndex)
+	DPrintf("peerID: %v, last term: %v, last index: %v", rf.me, args.LastLogTerm, args.LastLogIndex)
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+	}
+
 	DPrintf("peerID: %v, votedFor: %v", rf.me, rf.votedFor)
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogIndex >= rf.commitIndex && args.LastLogTerm >= rf.currentTerm) {
+		rf.votedFor = args.CandidateId
+		rf.state = Follower
+		now := time.Now()
+		rf.leaderMessageTimestamp = now.UnixMilli()
 		reply.Term = args.Term
 		reply.VoteGranted = true
 	}
@@ -298,25 +318,28 @@ func (rf *Raft) ticker() {
 		diff := ts - rf.leaderMessageTimestamp
 		if diff > rf.electionTimeout {
 			DPrintf("Election timeout for %v\n", rf.me)
-			rf.votedFor = -1
+			rf.votedFor = rf.me
+			rf.state = Candidate
 		}
-		noLeader := rf.votedFor == -1
+		isCandidate := rf.state == Candidate
 		rf.mu.Unlock()
 
-		if noLeader {
+		if isCandidate {
+			rf.mu.Lock()
+			rf.currentTerm += 1
 			request := &RequestVoteArgs{
-				Term:         rf.currentTerm + 1,
+				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogIndex: rf.commitIndex,
 				LastLogTerm:  rf.currentTerm,
 			}
+			rf.mu.Unlock()
 
 			electionWon := rf.sendRequestVotesAllPeers(request)
 
 			if electionWon {
 				rf.mu.Lock()
-				rf.votedFor = rf.me
-				rf.currentTerm = request.Term
+				rf.state = Leader
 				rf.mu.Unlock()
 				DPrintf("Candidate %v has won the election in term %v\n", rf.votedFor, rf.currentTerm)
 				go rf.tickHeartbeats()
@@ -332,24 +355,50 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 }
 
 func (rf *Raft) sendHeartbeatAllPeers() {
+	rf.mu.Lock()
+	termHeartbeat := rf.currentTerm
+	termCommitIndex := rf.commitIndex
+	rf.mu.Unlock()
 	var request = &AppendEntriesRequest{
-		Term:         rf.currentTerm,
+		Term:         termHeartbeat,
 		LeaderId:     rf.me,
-		LeaderCommit: rf.commitIndex,
+		LeaderCommit: termCommitIndex,
 	}
 
-	var replies = make([]*AppendEntriesReply, len(rf.peers))
+	maxTerm := -1
 
 	for i := 0; i < len(rf.peers); i++ {
+		/*
+			if i == rf.me {
+				rf.mu.Lock()
+				now := time.Now()
+				rf.leaderMessageTimestamp = now.UnixMilli()
+				rf.mu.Unlock()
+				continue
+			}
+		*/
+
 		peerId := i
 		go func() {
 			var reply = &AppendEntriesReply{}
 			//DPrintf("sending heartbeat to %v from %v\n", peerId, rf.me)
 			rf.sendAppendEntries(peerId, request, reply)
 			//DPrintf("sent heartbeat to %v from %v\n", peerId, rf.me)
-			replies[peerId] = reply
+			rf.mu.Lock()
+			maxTerm = Max(maxTerm, reply.Term)
+			rf.mu.Unlock()
 		}()
 	}
+
+	rf.mu.Lock()
+	if maxTerm > termHeartbeat {
+		// move to follower
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.currentTerm = maxTerm
+	}
+	rf.mu.Unlock()
+
 }
 
 func getRandomRange(lower, upper int) (number int64) {
@@ -368,9 +417,16 @@ func (rf *Raft) tickHeartbeats() {
 	}
 }
 
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
+
 func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
 	// replies := make([]*RequestVoteReply, len(rf.peers))
-	votesGranted, repliesReceived := 1, 1
+	votesGranted, repliesReceived, maxTerm := 1, 1, -1
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -387,6 +443,7 @@ func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
 				votesGranted += 1
 			}
 			repliesReceived += 1
+			maxTerm = Max(maxTerm, reply.Term)
 			rf.mu.Unlock()
 		}()
 	}
@@ -396,17 +453,31 @@ func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
 
 	for true {
 		rf.mu.Lock()
-		if votesGranted >= majority || repliesReceived >= len(rf.peers) {
-			rf.mu.Unlock()
+		granted := votesGranted
+		received := repliesReceived
+		rf.mu.Unlock()
+		/*
+			now := time.Now()
+			if now.UnixMilli()%1000 == 0 {
+				DPrintf("candidate %v: checking votes: %v granted, %v replies received\n", rf.me, votesGranted, repliesReceived)
+			}
+		*/
+		if granted >= majority || received >= len(rf.peers) {
 			break
 		}
-		rf.mu.Unlock()
 	}
 
-	DPrintf("granted %v out of majority %v", votesGranted, majority)
 	electionWon := false
 	rf.mu.Lock()
-	electionWon = votesGranted >= majority
+	DPrintf("candidate %v: granted %v out of majority %v", rf.me, votesGranted, majority)
+	if maxTerm > rf.currentTerm {
+		// move to follower
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.currentTerm = maxTerm
+	} else {
+		electionWon = votesGranted >= majority
+	}
 	rf.mu.Unlock()
 
 	return electionWon
@@ -430,18 +501,22 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
 		reply.Success = false
+		reply.Term = rf.currentTerm
 		return
 	}
 
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.LeaderId
+		rf.state = Follower
 	}
 
 	// DPrintf("heartbeat received from leader %v for follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
 	now := time.Now()
 	rf.leaderMessageTimestamp = now.UnixMilli()
+	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 	reply.Success = true
 }
