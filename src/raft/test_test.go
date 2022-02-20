@@ -63,42 +63,42 @@ func TestReElection2A(t *testing.T) {
 
 	// if the leader disconnects, a new one should be elected.
 	cfg.disconnect(leader1)
-	fmt.Printf("leader %v disconnected\n", leader1)
-	fmt.Printf("checking one leader...\n")
+	DPrintf("leader %v disconnected\n", leader1)
+	DPrintf("checking one leader...\n")
 	cfg.checkOneLeader()
-	fmt.Printf("leader established\n")
+	DPrintf("leader established\n")
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader.
-	fmt.Printf("connecting peer %v\n", leader1)
+	DPrintf("connecting peer %v\n", leader1)
 	cfg.connect(leader1)
-	fmt.Printf("peer %v connected\n", leader1)
-	fmt.Printf("checking next leader...\n")
+	DPrintf("peer %v connected\n", leader1)
+	DPrintf("checking next leader...\n")
 	leader2 := cfg.checkOneLeader()
-	fmt.Printf("current leader %v\n", leader2)
+	DPrintf("current leader %v\n", leader2)
 
 	// if there's no quorum, no leader should
 	// be elected.
-	fmt.Printf("disconnecting leader %v and peer %v\n", leader2, (leader2+1)%servers)
+	DPrintf("disconnecting leader %v and peer %v\n", leader2, (leader2+1)%servers)
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
-	fmt.Printf("leader %v and peer %v disconnected\n", leader2, (leader2+1)%servers)
+	DPrintf("leader %v and peer %v disconnected\n", leader2, (leader2+1)%servers)
 	time.Sleep(2 * RaftElectionTimeout)
-	fmt.Printf("checking no leader...\n")
+	DPrintf("checking no leader...\n")
 	cfg.checkNoLeader()
-	fmt.Printf("no leader checked\n")
+	DPrintf("no leader checked\n")
 
 	// if a quorum arises, it should elect a leader.
-	fmt.Printf("connecting %v...\n", (leader2+1)%servers)
+	DPrintf("connecting %v...\n", (leader2+1)%servers)
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
-	fmt.Printf("new leader elected...\n")
+	DPrintf("new leader elected...\n")
 
 	// re-join of last node shouldn't prevent leader from existing.
-	fmt.Printf("reconnecting %v...\n", leader2)
+	DPrintf("reconnecting %v...\n", leader2)
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
-	fmt.Printf("leader established\n")
+	DPrintf("leader established\n")
 
 	cfg.end()
 }
@@ -112,15 +112,15 @@ func TestManyElections2A(t *testing.T) {
 
 	cfg.checkOneLeader()
 
-	fmt.Printf("disconnecting random nodes...\n")
+	DPrintf("disconnecting random nodes...\n")
 	iters := 10
 	for ii := 1; ii < iters; ii++ {
-		fmt.Printf("RUNNING iteration: %v out of %v\n", ii, iters)
+		DPrintf("RUNNING iteration: %v out of %v\n", ii, iters)
 		// disconnect three nodes
 		i1 := rand.Int() % servers
 		i2 := rand.Int() % servers
 		i3 := rand.Int() % servers
-		fmt.Printf("disconnecting nodes: %v, %v, %v\n", i1, i2, i3)
+		DPrintf("disconnecting nodes: %v, %v, %v\n", i1, i2, i3)
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
@@ -128,9 +128,9 @@ func TestManyElections2A(t *testing.T) {
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
 		leader := cfg.checkOneLeader()
-		fmt.Printf("new leader: %v\n", leader)
+		DPrintf("new leader: %v\n", leader)
 
-		fmt.Printf("reconnecting nodes: %v, %v, %v\n", i1, i2, i3)
+		DPrintf("reconnecting nodes: %v, %v, %v\n", i1, i2, i3)
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)

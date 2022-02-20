@@ -368,22 +368,11 @@ func (rf *Raft) sendHeartbeatAllPeers() {
 	maxTerm := -1
 
 	for i := 0; i < len(rf.peers); i++ {
-		/*
-			if i == rf.me {
-				rf.mu.Lock()
-				now := time.Now()
-				rf.leaderMessageTimestamp = now.UnixMilli()
-				rf.mu.Unlock()
-				continue
-			}
-		*/
 
 		peerId := i
 		go func() {
 			var reply = &AppendEntriesReply{}
-			//DPrintf("sending heartbeat to %v from %v\n", peerId, rf.me)
 			rf.sendAppendEntries(peerId, request, reply)
-			//DPrintf("sent heartbeat to %v from %v\n", peerId, rf.me)
 			rf.mu.Lock()
 			maxTerm = Max(maxTerm, reply.Term)
 			rf.mu.Unlock()
@@ -425,7 +414,6 @@ func Max(x, y int) int {
 }
 
 func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
-	// replies := make([]*RequestVoteReply, len(rf.peers))
 	votesGranted, repliesReceived, maxTerm := 1, 1, -1
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -448,7 +436,6 @@ func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
 		}()
 	}
 
-	// runtime.Breakpoint()
 	majority := (len(rf.peers) + 1) / 2
 
 	for true {
@@ -456,15 +443,10 @@ func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
 		granted := votesGranted
 		received := repliesReceived
 		rf.mu.Unlock()
-		/*
-			now := time.Now()
-			if now.UnixMilli()%1000 == 0 {
-				DPrintf("candidate %v: checking votes: %v granted, %v replies received\n", rf.me, votesGranted, repliesReceived)
-			}
-		*/
 		if granted >= majority || received >= len(rf.peers) {
 			break
 		}
+		time.Sleep(time.Duration(1) * time.Millisecond)
 	}
 
 	electionWon := false
@@ -513,7 +495,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.state = Follower
 	}
 
-	// DPrintf("heartbeat received from leader %v for follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
+	// DPrintf("heartbeat received from leader %v f r follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
 	now := time.Now()
 	rf.leaderMessageTimestamp = now.UnixMilli()
 	reply.Term = rf.currentTerm
