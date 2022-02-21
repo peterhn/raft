@@ -358,6 +358,8 @@ func (rf *Raft) sendHeartbeatAllPeers() {
 	rf.mu.Lock()
 	termHeartbeat := rf.currentTerm
 	termCommitIndex := rf.commitIndex
+	now := time.Now()
+	rf.leaderMessageTimestamp = now.UnixMilli()
 	rf.mu.Unlock()
 	var request = &AppendEntriesRequest{
 		Term:         termHeartbeat,
@@ -368,6 +370,9 @@ func (rf *Raft) sendHeartbeatAllPeers() {
 	maxTerm := -1
 
 	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
 
 		peerId := i
 		go func() {
@@ -396,7 +401,7 @@ func getRandomRange(lower, upper int) (number int64) {
 }
 
 func (rf *Raft) tickHeartbeats() {
-	var tickTime = 10
+	var tickTime = 50
 	DPrintf("starting heartbeats for: %v votedFor: %v", rf.me, rf.votedFor)
 	_, isLeader := rf.GetState()
 	for isLeader {
@@ -482,14 +487,16 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	if args.Term < rf.currentTerm {
-		rf.mu.Unlock()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+	if args.Term < currentTerm {
 		reply.Success = false
-		reply.Term = rf.currentTerm
+		reply.Term = currentTerm
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	rf.mu.Lock()
+	if args.Term > currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.LeaderId
 		rf.state = Follower
@@ -498,8 +505,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	// DPrintf("heartbeat received from leader %v f r follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
 	now := time.Now()
 	rf.leaderMessageTimestamp = now.UnixMilli()
-	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
+	reply.Term = currentTerm
 	reply.Success = true
 }
 
