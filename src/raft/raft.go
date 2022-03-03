@@ -53,7 +53,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Value string
+	Value interface{}
 	Term  int
 }
 
@@ -80,7 +80,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	logEntries  []LogEntry
+	logEntries  []*LogEntry
 	commitIndex int
 	lastApplied int
 
@@ -90,6 +90,8 @@ type Raft struct {
 	leaderMessageTimestamp int64
 	electionTimeout        int64
 	state                  State
+
+	applyMessge chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -272,13 +274,44 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	index := rf.commitIndex + 1
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
+	rf.mu.Unlock()
+
+	logEntry := &LogEntry{
+		Value: command,
+		Term:  term,
+	}
+
+	logEntries := append(rf.logEntries, logEntry)
 
 	// Your code here (2B).
+	// fmt.Printf("Received Message: %v (Leader: %v, Term: %v, CommitIndex: %v)\n", command, isLeader, term, index)
+
+	rf.mu.Lock()
+	rf.lastApplied += 1
+	rf.logEntries = logEntries
+	rf.mu.Unlock()
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) replicateLogsAllPeers(logEntries *[]*LogEntry) {
+	peerNextIndexes := rf.nextIndex
+	for i := 0; i < len(rf.peers); i++ {
+
+		var request = &AppendEntriesRequest{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			LeaderCommit: rf.commitIndex,
+			PrevLogIndex: peerNextIndexes[i],
+		}
+
+		reply := &AppendEntriesReply{}
+		rf.sendAppendEntries(i, request, reply)
+	}
 }
 
 //
@@ -531,6 +564,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.votedFor = -1
 	rf.electionTimeout = getRandomRange(150, 300)
+	rf.applyMessge = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
