@@ -276,42 +276,88 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
-	index := rf.commitIndex + 1
+	commitIndex := rf.commitIndex
 	term := rf.currentTerm
+	lastApplied := rf.lastApplied
 	isLeader := rf.state == Leader
 	rf.mu.Unlock()
 
-	logEntry := &LogEntry{
-		Value: command,
-		Term:  term,
-	}
-
-	logEntries := append(rf.logEntries, logEntry)
-
-	// Your code here (2B).
-	// fmt.Printf("Received Message: %v (Leader: %v, Term: %v, CommitIndex: %v)\n", command, isLeader, term, index)
-
-	rf.mu.Lock()
-	rf.lastApplied += 1
-	rf.logEntries = logEntries
-	rf.mu.Unlock()
-
-	return index, term, isLeader
-}
-
-func (rf *Raft) replicateLogsAllPeers(logEntries *[]*LogEntry) {
-	peerNextIndexes := rf.nextIndex
-	for i := 0; i < len(rf.peers); i++ {
-
-		var request = &AppendEntriesRequest{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			LeaderCommit: rf.commitIndex,
-			PrevLogIndex: peerNextIndexes[i],
+	if isLeader {
+		logEntry := LogEntry{
+			Value: command,
+			Term:  term,
 		}
 
-		reply := &AppendEntriesReply{}
-		rf.sendAppendEntries(i, request, reply)
+		// Your code here (2B).
+		// fmt.Printf("Received Message: %v (Leader: %v, Term: %v, CommitIndex: %v)\n", command, isLeader, term, index)
+		rf.replicateLogsAllPeers(logEntry, commitIndex, lastApplied, term)
+	}
+
+	return commitIndex, term, isLeader
+}
+
+func (rf *Raft) replicateLogsAllPeers(logEntry LogEntry, commitIndex, lastApplied, term int) {
+	rf.mu.Lock()
+	nextIndexes := rf.nextIndex
+	matchIndexes := rf.matchIndex
+	rf.logEntries = append(rf.logEntries, &logEntry)
+	rf.lastApplied += 1
+	logEntries := rf.logEntries
+	majority := (len(rf.peers) + 1) / 2
+	successResponse := 0
+	commitApplied := false
+	rf.mu.Unlock()
+
+	var replies []AppendEntriesReply
+	c := make(chan AppendEntriesReply)
+	go func(replyCh chan AppendEntriesReply) {
+		successResponse += 1
+		reply := <-replyCh
+		if successResponse >= majority && !commitApplied {
+			rf.mu.Lock()
+			rf.commitIndex += 1
+			commitApplied = true
+			rf.matchIndex[reply.PeerIndex] += 1
+			rf.nextIndex[reply.PeerIndex] += 1
+			rf.mu.Unlock()
+		}
+		if reply.Term > term {
+
+		}
+		replies = append(replies)
+	}(c)
+
+	for i := 0; i < len(rf.peers); i++ {
+		prevLogIndex := matchIndexes[i]
+		prevLogTerm := logEntries[prevLogIndex].Term
+		go sendLogEntry(rf, i, prevLogIndex, prevLogTerm, term, commitIndex, matchIndexes[i], nextIndexes[i], logEntries, c)
+	}
+
+	DPrintf("replies: %v", replies)
+}
+
+func sendLogEntry(rf *Raft, peerIndex, prevLogIndex, prevLogTerm, term, commitIndex, matchIndex, nextIndex int, logEntries []*LogEntry, c chan AppendEntriesReply) {
+	reply := AppendEntriesReply{}
+	reply.PeerIndex = peerIndex
+	var request = &AppendEntriesRequest{
+		Term:         term,
+		LeaderId:     rf.me,
+		LeaderCommit: commitIndex,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      logEntries[matchIndex:nextIndex],
+	}
+
+	rf.sendAppendEntries(peerIndex, request, &reply)
+	if reply.Success {
+		c <- reply
+	} else {
+		// retry
+		rf.mu.Lock()
+		rf.nextIndex[peerIndex] -= 1
+		nextIndex = rf.nextIndex[peerIndex]
+		rf.mu.Unlock()
+		sendLogEntry(rf, peerIndex, prevLogIndex, prevLogTerm, term, commitIndex, matchIndex, nextIndex, logEntries, c)
 	}
 }
 
@@ -376,6 +422,7 @@ func (rf *Raft) ticker() {
 			if electionWon {
 				rf.mu.Lock()
 				rf.state = Leader
+				rf.nextIndex = make([]int, rf.lastApplied+1)
 				rf.mu.Unlock()
 				DPrintf("Candidate %v has won the election in term %v\n", rf.votedFor, rf.currentTerm)
 				rf.tickHeartbeats()
@@ -476,6 +523,13 @@ func Max(x, y int) int {
 	return y
 }
 
+func Min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}
+
 func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
 	votesGranted, received := 1, 1
 	wg := sync.WaitGroup{}
@@ -542,20 +596,31 @@ type AppendEntriesRequest struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommit int
-	Entries      *[]*LogEntry
+	Entries      []*LogEntry
 }
 
 type AppendEntriesReply struct {
 	// Your data here (2A).
-	Term    int
-	Success bool
+	PeerIndex int
+	Term      int
+	Success   bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
+	logEntries := rf.logEntries
+	logLength := len(rf.logEntries)
 	rf.mu.Unlock()
-	if args.Term < currentTerm {
+
+	if args.Term < currentTerm || args.PrevLogIndex >= logLength {
+		reply.Success = false
+		reply.Term = currentTerm
+		return
+	}
+
+	logEntry := logEntries[args.PrevLogIndex]
+	if logEntry.Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = currentTerm
 		return
@@ -567,8 +632,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.votedFor = args.LeaderId
 		rf.state = Follower
 	}
+	rf.mu.Unlock()
 
-	DPrintf("heartbeat received from leader %v for follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
+	j := args.PrevLogIndex + 1
+	for i := 0; i < len(args.Entries); i++ {
+		logEntry := args.Entries[i]
+
+		if j < len(logEntries) {
+			logEntries[j] = logEntry
+		} else {
+			logEntries = append(logEntries, logEntry)
+		}
+		j += 1
+	}
+
+	rf.mu.Lock()
+	rf.logEntries = logEntries
+	rf.commitIndex = Min(args.LeaderCommit, rf.lastApplied)
+	// DPrintf("heartbeat received from leader %v f r follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
 	now := time.Now()
 	rf.leaderMessageTimestamp = now.UnixMilli()
 	rf.mu.Unlock()
@@ -598,6 +679,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionTimeout = getRandomRange(150, 300)
 	rf.applyMessge = applyCh
+
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex = append(rf.nextIndex, 0)
+		rf.matchIndex = append(rf.matchIndex, 0)
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
