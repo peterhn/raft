@@ -199,6 +199,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
 
@@ -316,6 +317,8 @@ func (rf *Raft) ticker() {
 		now := time.Now()
 		ts := now.UnixMilli()
 		diff := ts - rf.leaderMessageTimestamp
+		DPrintf("checking timeout for: %v, diff: %v, last: %v, curr: %v", rf.me, diff, rf.leaderMessageTimestamp, ts)
+
 		if diff > rf.electionTimeout {
 			DPrintf("Election timeout for %v\n", rf.me)
 			rf.votedFor = rf.me
@@ -342,7 +345,7 @@ func (rf *Raft) ticker() {
 				rf.state = Leader
 				rf.mu.Unlock()
 				DPrintf("Candidate %v has won the election in term %v\n", rf.votedFor, rf.currentTerm)
-				go rf.tickHeartbeats()
+				rf.tickHeartbeats()
 			}
 		}
 
@@ -358,8 +361,10 @@ func (rf *Raft) sendHeartbeatAllPeers() {
 	rf.mu.Lock()
 	termHeartbeat := rf.currentTerm
 	termCommitIndex := rf.commitIndex
+	// electionTimeout := rf.electionTimeout
 	now := time.Now()
 	rf.leaderMessageTimestamp = now.UnixMilli()
+	numPeers := len(rf.peers)
 	rf.mu.Unlock()
 	var request = &AppendEntriesRequest{
 		Term:         termHeartbeat,
@@ -367,8 +372,11 @@ func (rf *Raft) sendHeartbeatAllPeers() {
 		LeaderCommit: termCommitIndex,
 	}
 
-	maxTerm := -1
+	maxTerm := termHeartbeat
+	wg := sync.WaitGroup{}
+	wg.Add(numPeers - 1)
 
+	lock := sync.Mutex{}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -378,21 +386,38 @@ func (rf *Raft) sendHeartbeatAllPeers() {
 		go func() {
 			var reply = &AppendEntriesReply{}
 			rf.sendAppendEntries(peerId, request, reply)
-			rf.mu.Lock()
+			lock.Lock()
 			maxTerm = Max(maxTerm, reply.Term)
-			rf.mu.Unlock()
+			lock.Unlock()
+			wg.Done()
 		}()
 	}
 
-	rf.mu.Lock()
+	wg.Wait()
+	// waitTimeout(&wg, time.Duration(electionTimeout)*time.Millisecond)
+
 	if maxTerm > termHeartbeat {
+		rf.mu.Lock()
 		// move to follower
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.currentTerm = maxTerm
+		rf.mu.Unlock()
 	}
-	rf.mu.Unlock()
+}
 
+func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	c := make(chan struct{})
+	go func() {
+		defer close(c)
+		wg.Wait()
+	}()
+	select {
+	case <-c:
+		return false // completed normally
+	case <-time.After(timeout):
+		return true // timed out
+	}
 }
 
 func getRandomRange(lower, upper int) (number int64) {
@@ -405,7 +430,7 @@ func (rf *Raft) tickHeartbeats() {
 	DPrintf("starting heartbeats for: %v votedFor: %v", rf.me, rf.votedFor)
 	_, isLeader := rf.GetState()
 	for isLeader {
-		rf.sendHeartbeatAllPeers()
+		go rf.sendHeartbeatAllPeers()
 		time.Sleep(time.Duration(tickTime) * time.Millisecond)
 		_, isLeader = rf.GetState()
 	}
@@ -419,7 +444,19 @@ func Max(x, y int) int {
 }
 
 func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
-	votesGranted, repliesReceived, maxTerm := 1, 1, -1
+	votesGranted, received := 1, 1
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	lock := sync.Mutex{}
+	done := false
+	electionWon := false
+
+	rf.mu.Lock()
+	termHeartbeat := rf.currentTerm
+	maxTerm := rf.currentTerm
+	majority := (len(rf.peers) + 1) / 2
+	numPeers := len(rf.peers)
+	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -428,44 +465,40 @@ func (rf *Raft) sendRequestVotesAllPeers(request *RequestVoteArgs) bool {
 		peerId := i
 		go func() {
 			DPrintf("sending vote request for %v to peer %v for term %v...", request.CandidateId, peerId, request.Term)
-			reply := &RequestVoteReply{}
-			rf.sendRequestVote(peerId, request, reply)
+			reply := RequestVoteReply{}
+			rf.sendRequestVote(peerId, request, &reply)
 			DPrintf(" received %v for candidate %v from peer %v for term %v\n", reply.VoteGranted, rf.me, peerId, request.Term)
-			rf.mu.Lock()
+			//DPrintf("received reply: %v", reply)
+			lock.Lock()
+			received += 1
+			maxTerm = Max(maxTerm, reply.Term)
 			if reply.VoteGranted {
 				votesGranted += 1
 			}
-			repliesReceived += 1
-			maxTerm = Max(maxTerm, reply.Term)
-			rf.mu.Unlock()
+			if (votesGranted >= majority || received == numPeers) && !done {
+				done = true
+				electionWon = votesGranted >= majority
+				wg.Done()
+			}
+			lock.Unlock()
 		}()
 	}
 
-	majority := (len(rf.peers) + 1) / 2
+	wg.Wait()
 
-	for true {
-		rf.mu.Lock()
-		granted := votesGranted
-		received := repliesReceived
-		rf.mu.Unlock()
-		if granted >= majority || received >= len(rf.peers) {
-			break
-		}
-		time.Sleep(time.Duration(1) * time.Millisecond)
-	}
-
-	electionWon := false
-	rf.mu.Lock()
+	lock.Lock()
+	largerTerm := maxTerm > termHeartbeat
 	DPrintf("candidate %v: granted %v out of majority %v", rf.me, votesGranted, majority)
-	if maxTerm > rf.currentTerm {
+	lock.Unlock()
+	if largerTerm {
+		rf.mu.Lock()
 		// move to follower
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.currentTerm = maxTerm
-	} else {
-		electionWon = votesGranted >= majority
+		rf.mu.Unlock()
+		return false
 	}
-	rf.mu.Unlock()
 
 	return electionWon
 }
@@ -502,7 +535,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.state = Follower
 	}
 
-	// DPrintf("heartbeat received from leader %v f r follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
+	DPrintf("heartbeat received from leader %v for follower %v and term %v voted for %v\n", args.LeaderId, rf.me, rf.currentTerm, rf.votedFor)
 	now := time.Now()
 	rf.leaderMessageTimestamp = now.UnixMilli()
 	rf.mu.Unlock()
